@@ -58,6 +58,10 @@ const SIX_MONTHS_SECS: u64 = 60 * 60 * 24 * 7 * 26;
 /// Window in which a sponsor may challenge a verification outcome (#469)
 const DISPUTE_WINDOW_SECS: u64 = 60 * 60 * 24 * 7;
 
+/// Window in which a planter must start work after a sponsor deposits or the
+/// escrow can be expired and refunded — Closes #517.
+const FOURTEEN_DAYS_SECS: u64 = 60 * 60 * 24 * 14;
+
 /// Maximum slots per batch deposit (Stellar operation limit safety margin)
 const MAX_BATCH_SIZE: u32 = 50;
 
@@ -213,6 +217,11 @@ enum DataKey {
     JobSizeThreshold,
     /// Per-farmer single-donor escrow record
     Escrow(Address),
+    /// Per-farmer job-acceptance deadline (unix-seconds) — Closes #517.
+    /// Stored as a separate key (rather than a field on EscrowRecord) so that
+    /// adding the feature does not break compatibility with previously-deployed
+    /// storage rows whose XDR serialisation is fixed at deploy time.
+    JobDeadline(Address),
     /// Per-tree oracle survival report
     OracleReport(u64),
     /// Per-tree co-funded escrow record
@@ -386,6 +395,13 @@ impl TreeEscrow {
             },
         );
 
+        // Record the job-acceptance deadline so anyone can crank `expire_job`
+        // after 14 days if the planter hasn't started work. — #517
+        env.storage().persistent().set(
+            &DataKey::JobDeadline(farmer.clone()),
+            &(env.ledger().timestamp() + FOURTEEN_DAYS_SECS),
+        );
+
         env.events()
             .publish((symbol_short!("deposit"), farmer), amount);
     }
@@ -454,6 +470,12 @@ impl TreeEscrow {
                     year_proof: empty_hash,
                 },
             );
+            // Record the per-farmer job-acceptance deadline. — #517
+            env.storage().persistent().set(
+                &DataKey::JobDeadline(slot.farmer.clone()),
+                &(env.ledger().timestamp() + FOURTEEN_DAYS_SECS),
+            );
+
             env.events()
                 .publish((symbol_short!("deposit"), slot.farmer), slot.amount);
         }
@@ -691,6 +713,9 @@ impl TreeEscrow {
 
         rec.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&key, &rec);
+        // Drop the job-deadline key so it doesn't orphan under the manual-refund
+        // path; `expire_job` does the same on its success path (#517 symmetry).
+        env.storage().persistent().remove(&DataKey::JobDeadline(farmer.clone()));
 
         env.events()
             .publish((symbol_short!("refund"), farmer), rec.total_amount);
@@ -698,6 +723,73 @@ impl TreeEscrow {
 
     pub fn get_record(env: Env, farmer: Address) -> Option<EscrowRecord> {
         env.storage().persistent().get(&DataKey::Escrow(farmer))
+    }
+
+    // ── Planter job expiry (#517) ────────────────────────────────────────────────
+
+    /// Anyone-crankable call: refunds the donor if the planter hasn't started
+    /// work within `FOURTEEN_DAYS_SECS` of the deposit. The deadline is cleared
+    /// on success. Panics if the escrow is missing, the deadline hasn't
+    /// elapsed, or the escrow has already advanced past `Funded` (Planted,
+    /// Survived, Completed) or has already been refunded.
+    ///
+    /// Off-chain keepers and bots may call this freely; the only effect is a
+    /// refund to the original donor, so no privilege is conferred by skipping
+    /// authentication.
+    pub fn expire_job(env: Env, farmer: Address) {
+        let deadline_key = DataKey::JobDeadline(farmer.clone());
+        let deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&deadline_key)
+            .unwrap_or_else(|| panic!("no job deadline on file for farmer"));
+
+        let key = DataKey::Escrow(farmer.clone());
+        let mut rec: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no escrow for farmer"));
+
+        if rec.status != EscrowStatus::Funded {
+            if rec.status == EscrowStatus::Refunded {
+                panic!("job already refunded");
+            }
+            panic!("job already accepted (planting in progress)");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < deadline {
+            panic!("job not expired yet");
+        }
+
+        token::Client::new(&env, &rec.token).transfer(
+            &env.current_contract_address(),
+            &rec.donor,
+            &rec.total_amount,
+        );
+
+        rec.status = EscrowStatus::Refunded;
+        env.storage().persistent().set(&key, &rec);
+        env.storage().persistent().remove(&deadline_key);
+
+        env.events().publish(
+            (symbol_short!("jobexp"), farmer),
+            (rec.donor, rec.total_amount, deadline),
+        );
+    }
+
+    /// Returns the unix-seconds deadline at which `farmer`'s escrow can be
+    /// expired, or `None` if no escrow exists for `farmer` (or the deadline
+    /// was already cleared by a successful `expire_job`).
+    pub fn get_job_deadline(env: Env, farmer: Address) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::JobDeadline(farmer))
+    }
+
+    /// Returns the constant job-expiry window in seconds (14 days = 1_209_600).
+    /// Exposed so off-chain tooling doesn't need to hard-code the value.
+    pub fn get_job_expiry_secs(_env: Env) -> u64 {
+        FOURTEEN_DAYS_SECS
     }
 
     // ── Planter rating system (#483) ─────────────────────────────────────────
@@ -2260,6 +2352,200 @@ mod tests {
         ctx.client.release_proportional(&23, &4_000);
         assert_eq!(balance(&ctx.env, &ctx.token, &sponsor) - pre, 4_000);
     }
+
+    // ── Planter job expiry tests (#517) ────────────────────────────────────────────
+
+    /// Self-contained harness that does not rely on the calibre of the
+    /// existing `setup_*` helpers (which intentionally keep a known-broken
+    /// double-init for legacy reasons). Returns `(env, admin, client)`.
+    fn setup_expiry_test() -> (Env, Address, TreeEscrowClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, TreeEscrow);
+        let client = TreeEscrowClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tree_token_id =
+            env.register_stellar_asset_contract_v2(contract_id.clone())
+                .address();
+        client.initialize(
+            &admin,
+            &tree_token_id,
+            &oracle,
+            &DEFAULT_THRESHOLD,
+            &DEFAULT_MIN_DENSITY,
+            &DEFAULT_JOB_SIZE_THRESHOLD,
+        );
+        (env, admin, client)
+    }
+
+    fn setup_funded_expiry_test() -> (Env, Address, Address, Address, Address, TreeEscrowClient<'static>) {
+        let (env, admin, client) = setup_expiry_test();
+        let donor = Address::generate(&env);
+        let farmer = Address::generate(&env);
+
+        let token_id =
+            env.register_stellar_asset_contract_v2(admin.clone())
+                .address();
+        client.add_to_whitelist(&token_id);
+        token::StellarAssetClient::new(&env, &token_id).mint(&donor, &10_000);
+
+        client.deposit(&donor, &farmer, &token_id, &10_000, &5, &1);
+        (env, admin, donor, farmer, token_id, client)
+    }
+
+    #[test]
+    fn test_deposit_records_deadline_at_now_plus_14_days() {
+        let (env, _admin, _donor, farmer, _token, client) = setup_funded_expiry_test();
+        let deposit_ts: u64 = env.ledger().timestamp();
+        let deadline = client.get_job_deadline(&farmer).unwrap();
+        assert_eq!(deadline, deposit_ts + FOURTEEN_DAYS_SECS);
+        assert_eq!(deadline - deposit_ts, 14 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_expire_job_refunds_donor_after_14_days() {
+        let (env, _admin, donor, farmer, token, client) = setup_funded_expiry_test();
+
+        env.ledger().with_mut(|l| l.timestamp += FOURTEEN_DAYS_SECS + 1);
+
+        let pre_donor = token::Client::new(&env, &token).balance(&donor);
+        let pre_contract = token::Client::new(&env, &token).balance(&env.current_contract_address());
+
+        client.expire_job(&farmer);
+
+        // Donor is fully refunded.
+        assert_eq!(
+            token::Client::new(&env, &token).balance(&donor) - pre_donor,
+            10_000
+        );
+        // Contract balance drops back to pre-deposit (i.e. zero from this escrow).
+        assert_eq!(
+            token::Client::new(&env, &token).balance(&env.current_contract_address()),
+            pre_contract - 10_000
+        );
+        assert_eq!(
+            client.get_record(&farmer).unwrap().status,
+            EscrowStatus::Refunded
+        );
+        assert!(client.get_job_deadline(&farmer).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "job not expired yet")]
+    fn test_expire_job_panics_one_second_before_deadline() {
+        let (env, _admin, _donor, farmer, _token, client) = setup_funded_expiry_test();
+        env.ledger().with_mut(|l| l.timestamp += FOURTEEN_DAYS_SECS - 1);
+        client.expire_job(&farmer);
+    }
+
+    #[test]
+    #[should_panic(expected = "job not expired yet")]
+    fn test_expire_job_panics_at_exact_deadline_minus_one() {
+        let (env, _admin, _donor, farmer, _token, client) = setup_funded_expiry_test();
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        client.expire_job(&farmer);
+    }
+
+    #[test]
+    #[should_panic(expected = "job already accepted (planting in progress)")]
+    fn test_expire_job_panics_after_first_progress_update() {
+        let (env, _admin, _donor, farmer, _token, client) = setup_funded_expiry_test();
+        // First verify_progress transitions Funded → Planted (planter accepted).
+        client.verify_progress(&farmer, &proof(&env, 1), &5);
+        env.ledger().with_mut(|l| l.timestamp += FOURTEEN_DAYS_SECS + 1);
+        client.expire_job(&farmer);
+    }
+
+    #[test]
+    #[should_panic(expected = "job already refunded")]
+    fn test_expire_job_panics_when_called_twice() {
+        let (env, _admin, _donor, farmer, _token, client) = setup_funded_expiry_test();
+        env.ledger().with_mut(|l| l.timestamp += FOURTEEN_DAYS_SECS + 1);
+        client.expire_job(&farmer);
+        // Status is now Refunded; second call should panic.
+        client.expire_job(&farmer);
+    }
+
+    #[test]
+    #[should_panic(expected = "job already refunded")]
+    fn test_expire_job_panics_after_admin_refund() {
+        let (env, _admin, _donor, farmer, _token, client) = setup_funded_expiry_test();
+        // Admin's manual refund also flips status → Refunded.
+        client.refund(&farmer);
+        env.ledger().with_mut(|l| l.timestamp += FOURTEEN_DAYS_SECS + 1);
+        client.expire_job(&farmer);
+    }
+
+    #[test]
+    #[should_panic(expected = "no job deadline on file for farmer")]
+    fn test_expire_job_panics_for_unknown_farmer() {
+        let (env, _admin, _donor, _farmer, _token, client) = setup_funded_expiry_test();
+        let phantom = Address::generate(&env);
+        client.expire_job(&phantom);
+    }
+
+    #[test]
+    fn test_expire_job_scoped_to_one_farmer_other_escrows_unaffected() {
+        let (env, _admin, _donor1, farmer1, token, client) = setup_funded_expiry_test();
+        // Add a second donor + farmer so we have two escrows to compare.
+        let donor2 = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &token).mint(&donor2, &10_000);
+        let farmer2 = Address::generate(&env);
+        client.deposit(&donor2, &farmer2, &token, &10_000, &5, &1);
+
+        env.ledger().with_mut(|l| l.timestamp += FOURTEEN_DAYS_SECS + 1);
+
+        client.expire_job(&farmer1);
+
+        // farmer1 refunded
+        assert_eq!(
+            client.get_record(&farmer1).unwrap().status,
+            EscrowStatus::Refunded
+        );
+        // farmer2 untouched
+        assert_eq!(
+            client.get_record(&farmer2).unwrap().status,
+            EscrowStatus::Funded
+        );
+        assert!(client.get_job_deadline(&farmer2).is_some());
+    }
+
+    #[test]
+    fn test_get_job_expiry_secs_is_fourteen_days() {
+        let (_env, _admin, _donor, _farmer, _token, client) = setup_funded_expiry_test();
+        assert_eq!(client.get_job_expiry_secs(), 14 * 24 * 60 * 60);
+        assert_eq!(client.get_job_expiry_secs(), FOURTEEN_DAYS_SECS);
+    }
+
+    #[test]
+    fn test_batch_deposit_records_per_farmer_deadlines() {
+        let (env, _admin, _donor1, _farmer1, _token, client) = setup_funded_expiry_test();
+        let donor2 = Address::generate(&env);
+        let _ = donor2; // donor not used here — we batch on donor1's tokens; batch_deposit requires donor
+        // Hop on the existing fungible-token from the first setup; mint to donor1.
+        // (We've already used donor1 to deposit for farmer1 — re-deposit would
+        // fail because per-farmer escrow already exists. So use donor1 for the
+        // batch into a *new* farmer.)
+        let f2 = Address::generate(&env);
+        let token_id = _token.clone();
+        token::StellarAssetClient::new(&env, &token_id).mint(&_donor1, &1_000);
+        let slots = vec![
+            &env,
+            BatchSlot {
+                farmer: f2.clone(),
+                amount: 1_000,
+                gift_recipient: None,
+                referrer: None,
+            },
+        ];
+        client.batch_deposit(&_donor1, &token_id, &slots);
+
+        let ts = env.ledger().timestamp();
+        assert_eq!(client.get_job_deadline(&f2).unwrap(), ts + FOURTEEN_DAYS_SECS);
+    }
+
+    // ── proptest ────────────────────────────────────────────────────────────────
 
     use proptest::prelude::*;
     use std::collections::HashSet;
