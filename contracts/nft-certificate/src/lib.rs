@@ -1,6 +1,6 @@
 #![no_std]
 
-//! NFT Certificate — Closes #653
+//! NFT Certificate — Closes #653 + #753 (soulbound non-transferable)
 //!
 //! SEP-41 NFT contract for CO2 certificates with merge functionality.
 //!
@@ -8,6 +8,9 @@
 //! certificates into a single consolidated certificate. The merge function
 //! verifies ownership of all certificates being merged and aggregates the
 //! treeCount and co2OffsetKg metadata values.
+//!
+//! As of #753, tokens can be flagged as soulbound (non-transferable),
+//! preventing them from being merged or transferred on-chain.
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, symbol_short, Address, Env, String,
@@ -39,6 +42,8 @@ pub struct Token {
     pub owner: Address,
     /// Token metadata
     pub metadata: CertificateMetadata,
+    /// Whether this token is soulbound (non-transferable)
+    pub soulbound: bool,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -90,6 +95,7 @@ impl NftCertificate {
         let token = Token {
             owner: to.clone(),
             metadata,
+            soulbound: false,
         };
 
         env.storage().instance().set(&token_id, &token);
@@ -118,6 +124,9 @@ impl NftCertificate {
     /// 1. Verifies ownership of all certificates being merged
     /// 2. Burns all input certificates
     /// 3. Mints a single consolidated certificate with aggregated metadata
+    ///
+    /// # Errors
+    /// - `NftError::TokenIsSoulbound` — if any token being merged is soulbound.
     pub fn merge(
         env: Env,
         owner: Address,
@@ -148,10 +157,15 @@ impl NftCertificate {
         let mut total_tree_count = 0i128;
         let mut total_co2_offset = 0i128;
 
-        // Verify ownership and aggregate metadata from all certificates
+        // Verify ownership, check soulbound status and aggregate metadata from all certificates
         for i in 0..token_ids.len() {
             let token_id = token_ids.get(i).unwrap();
-            
+
+            // Check if the token is soulbound (non-transferable)
+            if Self::is_soulbound(env.clone(), token_id) {
+                panic_with_error!(&env, NftError::TokenIsSoulbound);
+            }
+
             let token: Token = env
                 .storage()
                 .instance()
@@ -231,7 +245,37 @@ impl NftCertificate {
             .unwrap_or(0)
     }
 
-    // ── Admin functions ───────────────────────────────────────────────────────
+    /// Set or unset the soulbound (non-transferable) flag on a token.
+    /// Admin only. When a token is soulbound, it cannot be merged
+    /// into another certificate.
+    pub fn set_soulbound(env: Env, admin: Address, token_id: u64, soulbound: bool) {
+        Self::require_admin(&env);
+        admin.require_auth();
+
+        let token: Token = env
+            .storage()
+            .instance()
+            .get(&token_id)
+            .unwrap_or_else(|| panic_with_error!(&env, NftError::TokenNotFound));
+
+        let mut updated = token.clone();
+        updated.soulbound = soulbound;
+        env.storage().instance().set(&token_id, &updated);
+
+        env.events()
+            .publish((symbol_short!("soulbound"), admin), (token_id, soulbound));
+    }
+
+    /// Check whether a token is flagged as soulbound (non-transferable).
+    pub fn is_soulbound(env: Env, token_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .get::<u64, Token>(&token_id)
+            .map(|token| token.soulbound)
+            .unwrap_or(false)
+    }
+
+    // ── Admin functions ──────────────────────────────────────────────
 
     /// Pause all state-changing functions. Admin only.
     pub fn pause(env: Env) {
@@ -281,7 +325,7 @@ impl NftCertificate {
         String::from_str(&env, "data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"400\" height=\"400\"><rect width=\"100%\" height=\"100%\" fill=\"#1b4332\"/><text x=\"20\" y=\"40\" fill=\"#ffffff\">Harvesta NFT Certificate</text></svg>")
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────────
+    // ── Internal ──────────────────────────────────────────────────────
 
     fn require_admin(env: &Env) {
         let admin: Address = env
@@ -387,18 +431,18 @@ mod tests {
         let (env, _, client) = setup();
 
         let owner = Address::generate(&env);
-        
+
         // Mint two certificates
         let meta1 = metadata(&env, 50, 2400);
         let meta2 = metadata(&env, 75, 3600);
-        
+
         client.mint(&owner.clone(), &1, &meta1);
         client.mint(&owner.clone(), &2, &meta2);
 
         // Merge them
         let merged_meta = metadata(&env, 125, 6000);
         let token_ids = Vec::from_array(&env, [1, 2]);
-        
+
         client.merge(&owner.clone(), &token_ids, &3, &merged_meta);
 
         // Verify old tokens are burned
@@ -422,13 +466,13 @@ mod tests {
 
         let owner = Address::generate(&env);
         let other = Address::generate(&env);
-        
+
         let meta1 = metadata(&env, 50, 2400);
         client.mint(&owner, &1, &meta1);
 
         let merged_meta = metadata(&env, 50, 2400);
         let token_ids = Vec::from_array(&env, [1]);
-        
+
         // Try to merge with wrong owner
         client.merge(&other, &token_ids, &2, &merged_meta);
     }
@@ -441,7 +485,7 @@ mod tests {
         let owner = Address::generate(&env);
         let merged_meta = metadata(&env, 50, 2400);
         let token_ids = Vec::from_array(&env, []);
-        
+
         client.merge(&owner, &token_ids, &2, &merged_meta);
     }
 
@@ -451,14 +495,14 @@ mod tests {
         let (env, _, client) = setup();
 
         let owner = Address::generate(&env);
-        
+
         let meta1 = metadata(&env, 50, 2400);
         client.mint(&owner.clone(), &1, &meta1);
 
         // Try to merge with wrong aggregated metadata
         let wrong_meta = metadata(&env, 100, 4800); // Should be 50, 2400
         let token_ids = Vec::from_array(&env, [1]);
-        
+
         client.merge(&owner, &token_ids, &2, &wrong_meta);
     }
 
@@ -475,7 +519,7 @@ mod tests {
 
         let merged_meta = metadata(&env, 50, 2400);
         let token_ids = Vec::from_array(&env, [1]);
-        
+
         client.merge(&owner, &token_ids, &2, &merged_meta);
     }
 
@@ -509,5 +553,76 @@ mod tests {
 
         let uri = client.token_uri(&1);
         assert!(uri.len() > 0);
+    }
+
+    // ── Soulbound tests (#753) ──────────────────────────────────────────
+
+    #[test]
+    fn test_set_soulbound_marks_token() {
+        let (env, admin, client) = setup();
+        let owner = Address::generate(&env);
+        let meta = metadata(&env, 50, 2400);
+        client.mint(&owner, &1, &meta);
+
+        // Token should not be soulbound by default
+        assert!(!client.is_soulbound(&1));
+
+        // Set soulbound
+        client.set_soulbound(&admin, &1, true);
+        assert!(client.is_soulbound(&1));
+    }
+
+    #[test]
+    fn test_set_soulbound_allows_unset() {
+        let (env, admin, client) = setup();
+        let owner = Address::generate(&env);
+        let meta = metadata(&env, 50, 2400);
+        client.mint(&owner, &1, &meta);
+
+        client.set_soulbound(&admin, &1, true);
+        assert!(client.is_soulbound(&1));
+
+        client.set_soulbound(&admin, &1, false);
+        assert!(!client.is_soulbound(&1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #4)")]
+    fn test_merge_soulbound_token_rejected() {
+        let (env, admin, client) = setup();
+
+        let owner = Address::generate(&env);
+
+        let meta1 = metadata(&env, 50, 2400);
+        client.mint(&owner.clone(), &1, &meta1);
+
+        let meta2 = metadata(&env, 75, 3600);
+        client.mint(&owner.clone(), &2, &meta2);
+
+        // Mark token 1 as soulbound
+        client.set_soulbound(&admin, &1, true);
+
+        // Attempt to merge should fail with TokenIsSoulbound
+        let merged_meta = metadata(&env, 125, 6000);
+        let token_ids = Vec::from_array(&env, [1, 2]);
+        client.merge(&owner, &token_ids, &3, &merged_meta);
+    }
+
+    #[test]
+    fn test_merge_soulbound_token_only() {
+        let (env, admin, client) = setup();
+
+        let owner = Address::generate(&env);
+
+        let meta1 = metadata(&env, 50, 2400);
+        client.mint(&owner.clone(), &1, &meta1);
+
+        // Mark token as soulbound
+        client.set_soulbound(&admin, &1, true);
+
+        // Merging a single soulbound token should also be rejected
+        let merged_meta = metadata(&env, 50, 2400);
+        let token_ids = Vec::from_array(&env, [1]);
+        client.merge(&owner, &token_ids, &2, &merged_meta);
     }
 }
